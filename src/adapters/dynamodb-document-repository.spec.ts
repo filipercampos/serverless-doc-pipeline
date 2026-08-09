@@ -35,11 +35,9 @@ describe('DynamoDbDocumentRepository', () => {
   });
 
   it('reads with strong consistency and strips key attributes', async () => {
-    ddb
-      .on(GetCommand)
-      .resolves({
-        Item: { PK: 'TENANT#acme', SK: `DOC#${documentId}`, entity: 'Document', ...doc },
-      });
+    ddb.on(GetCommand).resolves({
+      Item: { PK: 'TENANT#acme', SK: `DOC#${documentId}`, entity: 'Document', ...doc },
+    });
     await expect(repo.get(tenantId, documentId)).resolves.toEqual(doc);
     expect(ddb.commandCalls(GetCommand)[0]!.args[0].input).toMatchObject({
       Key: { PK: 'TENANT#acme', SK: `DOC#${documentId}` },

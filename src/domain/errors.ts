@@ -22,3 +22,11 @@ export class DocumentNotFoundError extends DomainError {
 export class InvalidTransitionError extends DomainError {
   readonly code = 'invalid_transition';
 }
+
+/**
+ * The uploaded content is definitively unacceptable (wrong type, malformed text format).
+ * Terminal: the document is marked REJECTED and the message is acknowledged, never retried.
+ */
+export class ContentRejectedError extends DomainError {
+  readonly code = 'content_rejected';
+}
