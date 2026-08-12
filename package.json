@@ -17,6 +17,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",
+    "@smithy/util-stream": "^4.7.16",
     "@types/aws-lambda": "^8.10.162",
     "@types/jest": "^29.5.14",
     "@types/node": "^22.20.1",
@@ -29,7 +30,9 @@
     "typescript-eslint": "^8.65.0"
   },
   "dependencies": {
+    "@aws-lambda-powertools/batch": "^2.34.0",
     "@aws-sdk/client-dynamodb": "^3.1105.0",
+    "@aws-sdk/client-eventbridge": "^3.1106.0",
     "@aws-sdk/client-s3": "^3.1103.0",
     "@aws-sdk/lib-dynamodb": "^3.1105.0",
     "@aws-sdk/s3-presigned-post": "^3.1103.0",
