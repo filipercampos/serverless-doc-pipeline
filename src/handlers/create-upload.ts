@@ -21,7 +21,7 @@ const useCase = new RequestUpload({
   signer: new S3UploadSigner(s3Client(), bucket),
   clock: systemClock,
   policy,
-  pendingTtlSeconds: intEnv('PENDING_TTL_SECONDS', 86_400),
+  pendingTtlSeconds: intEnv('PENDING_TTL_SECONDS', 7 * 86_400),
   newId: () => uuidv7(),
 });
 
