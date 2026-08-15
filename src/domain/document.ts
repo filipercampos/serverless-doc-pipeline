@@ -26,6 +26,8 @@ export interface Document {
   updatedAt: string;
   /** Epoch seconds; pending records that never receive an upload are expired by DynamoDB TTL. */
   expiresAt?: number;
+  /** S3 version that was validated; consumers must read exactly this version. */
+  versionId?: string;
   sizeBytes?: number;
   sha256?: string;
   metadata?: DocumentMetadata;

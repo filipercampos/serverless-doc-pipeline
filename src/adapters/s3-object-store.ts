@@ -12,10 +12,12 @@ export class S3ObjectStore implements ObjectStore {
     private readonly bucket: string,
   ) {}
 
-  async read(key: string, maxBytes: number): Promise<StoredObject | null> {
+  async read(key: string, maxBytes: number, versionId?: string): Promise<StoredObject | null> {
     let res;
     try {
-      res = await this.s3.send(new GetObjectCommand({ Bucket: this.bucket, Key: key }));
+      res = await this.s3.send(
+        new GetObjectCommand({ Bucket: this.bucket, Key: key, VersionId: versionId }),
+      );
     } catch (err) {
       if (err instanceof NoSuchKey) return null;
       throw err;

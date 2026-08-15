@@ -145,4 +145,17 @@ describe('ProcessDocument', () => {
     const { useCase } = setup({ bytes: null });
     await expect(useCase.execute(key)).resolves.toMatchObject({ outcome: 'ignored' });
   });
+
+  it('pins the processed S3 version and ignores later overwrites of the same key', async () => {
+    const { useCase, objects, events, current } = setup({ bytes: sampleCsv });
+    await useCase.execute(key, 'v1');
+    expect(current()?.versionId).toBe('v1');
+    expect(objects.read).toHaveBeenCalledWith(key, 1024 * 1024, 'v1');
+
+    await expect(useCase.execute(key, 'v2')).resolves.toEqual({
+      outcome: 'ignored',
+      reason: 'object overwritten after processing',
+    });
+    expect(events.processed).toHaveBeenCalledTimes(1);
+  });
 });

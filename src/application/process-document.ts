@@ -12,7 +12,7 @@ export interface StoredObject {
 
 export interface ObjectStore {
   /** Returns null if the object no longer exists. Never buffers more than `maxBytes`. */
-  read(key: string, maxBytes: number): Promise<StoredObject | null>;
+  read(key: string, maxBytes: number, versionId?: string): Promise<StoredObject | null>;
   /** Marks an object so the bucket lifecycle can expire it (rejected / orphaned uploads). */
   tag(key: string, status: 'rejected' | 'orphan'): Promise<void>;
 }
@@ -55,7 +55,11 @@ export interface ProcessDocumentDeps {
 export class ProcessDocument {
   constructor(private readonly deps: ProcessDocumentDeps) {}
 
-  async execute(objectKey: string): Promise<ProcessOutcome> {
+  /**
+   * @param versionId S3 version from the event. With bucket versioning on, a client re-using a
+   *   still-valid presigned POST creates a *new version*; the processed version is pinned on the record.
+   */
+  async execute(objectKey: string, versionId?: string): Promise<ProcessOutcome> {
     const { repository, objects, clock } = this.deps;
 
     const parsed = parseObjectKey(objectKey);
@@ -70,11 +74,16 @@ export class ProcessDocument {
       return { outcome: 'ignored', reason: 'no document record' };
     }
     if (doc.status !== 'PENDING_UPLOAD') {
+      if (doc.versionId && versionId && doc.versionId !== versionId) {
+        // Content swap after validation: never re-validate or re-announce. The record keeps
+        // pointing at the validated version.
+        return { outcome: 'ignored', reason: 'object overwritten after processing' };
+      }
       await this.publish(doc);
       return { outcome: 'duplicate', documentId: doc.documentId, republished: true };
     }
 
-    const object = await objects.read(objectKey, this.deps.maxBytes);
+    const object = await objects.read(objectKey, this.deps.maxBytes, versionId);
     if (!object) return { outcome: 'ignored', reason: 'object no longer exists' };
 
     let next: Document;
@@ -91,6 +100,8 @@ export class ProcessDocument {
         next = markRejected(doc, err.message, clock.now(), { sizeBytes: object.sizeBytes });
       }
     }
+
+    if (versionId) next = { ...next, versionId };
 
     // Conditional write: only one concurrent delivery can move the document out of PENDING_UPLOAD.
     const applied = await repository.transition(next, 'PENDING_UPLOAD');

@@ -19,13 +19,16 @@ export function s3Client(credentials?: Credentials): S3Client {
   });
 }
 
-export function dynamoDbDocumentClient(credentials?: Credentials): DynamoDBDocumentClient {
+export function dynamoDbClient(credentials?: Credentials): DynamoDBClient {
   const endpoint = awsEndpoint();
-  const base = new DynamoDBClient({
+  return new DynamoDBClient({
     ...(endpoint ? { endpoint } : {}),
     ...(credentials ? { credentials } : {}),
   });
-  return DynamoDBDocumentClient.from(base, {
+}
+
+export function dynamoDbDocumentClient(credentials?: Credentials): DynamoDBDocumentClient {
+  return DynamoDBDocumentClient.from(dynamoDbClient(credentials), {
     marshallOptions: { removeUndefinedValues: true, convertClassInstanceToMap: false },
   });
 }

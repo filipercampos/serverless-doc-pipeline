@@ -6,6 +6,8 @@ export interface S3ObjectRef {
   key: string;
   size: number;
   eTag?: string;
+  /** Present when bucket versioning is enabled. */
+  versionId?: string;
   /** Orders events for the same key; identical across duplicate deliveries of one event. */
   sequencer: string;
 }
@@ -43,6 +45,7 @@ export function parseS3Notification(body: string): S3ObjectRef[] {
       key: decodeURIComponent(r.s3.object.key.replace(/\+/g, ' ')),
       size: r.s3.object.size,
       eTag: r.s3.object.eTag,
+      versionId: r.s3.object.versionId,
       sequencer: r.s3.object.sequencer,
     }));
 }

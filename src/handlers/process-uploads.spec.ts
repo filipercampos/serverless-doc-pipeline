@@ -1,4 +1,12 @@
+import {
+  ConditionalCheckFailedException,
+  DeleteItemCommand,
+  DynamoDBClient,
+  PutItemCommand,
+  UpdateItemCommand,
+} from '@aws-sdk/client-dynamodb';
 import { EventBridgeClient, PutEventsCommand } from '@aws-sdk/client-eventbridge';
+import { marshall } from '@aws-sdk/util-dynamodb';
 import { GetObjectCommand, PutObjectTaggingCommand, S3Client } from '@aws-sdk/client-s3';
 import { DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
 import { sdkStreamMixin } from '@smithy/util-stream';
@@ -18,6 +26,8 @@ import type { SupportedContentType } from '../domain/upload-policy';
 import { handler } from './process-uploads';
 
 const ddb = mockClient(DynamoDBDocumentClient);
+// The idempotency persistence layer talks to the low-level client directly.
+const idem = mockClient(DynamoDBClient);
 const s3 = mockClient(S3Client);
 const eb = mockClient(EventBridgeClient);
 
@@ -45,6 +55,10 @@ function body(bytes: Buffer) {
 
 beforeEach(() => {
   ddb.reset();
+  idem.reset();
+  idem.on(PutItemCommand).resolves({});
+  idem.on(UpdateItemCommand).resolves({});
+  idem.on(DeleteItemCommand).resolves({});
   s3.reset();
   eb.reset();
   ddb.on(GetCommand, { Key: { PK: 'TENANT#acme', SK: `DOC#${csvId}` } }).resolves({
@@ -113,5 +127,74 @@ describe('process-uploads handler', () => {
       lambdaContext(),
     );
     expect(res.batchItemFailures).toEqual([{ itemIdentifier: 'm1' }]);
+  });
+
+  describe('idempotency', () => {
+    it('stores the result keyed on bucket, key and sequencer', async () => {
+      await handler(sqsEvent(sqsRecord('m1', s3NotificationBody(keyOf(csvId)))), lambdaContext());
+
+      const put = idem.commandCalls(PutItemCommand)[0]!.args[0].input;
+      expect(put.TableName).toBe('idempotency-test');
+      expect(put.Item?.status?.S).toBe('INPROGRESS');
+      const update = idem.commandCalls(UpdateItemCommand)[0]!.args[0].input;
+      expect(JSON.stringify(update.ExpressionAttributeValues)).toContain('COMPLETED');
+    });
+
+    it('replays a completed record without reprocessing a duplicate delivery', async () => {
+      const stored = [{ outcome: 'processed', key: keyOf(csvId), status: 'PROCESSED' }];
+      idem.on(PutItemCommand).rejects(
+        new ConditionalCheckFailedException({
+          message: 'exists',
+          $metadata: {},
+          Item: marshall({
+            id: 'doc-pipeline#hash',
+            status: 'COMPLETED',
+            expiration: Math.floor(Date.now() / 1000) + 3600,
+            data: stored[0],
+          }),
+        }),
+      );
+
+      const res = await handler(
+        sqsEvent(sqsRecord('dup', s3NotificationBody(keyOf(csvId)))),
+        lambdaContext(),
+      );
+
+      expect(res.batchItemFailures).toEqual([]);
+      expect(s3.commandCalls(GetObjectCommand)).toHaveLength(0);
+      expect(ddb.commandCalls(PutCommand)).toHaveLength(0);
+      expect(eb.commandCalls(PutEventsCommand)).toHaveLength(0);
+    });
+
+    it('fails the record while another delivery is still in progress', async () => {
+      idem.on(PutItemCommand).rejects(
+        new ConditionalCheckFailedException({
+          message: 'exists',
+          $metadata: {},
+          Item: marshall({
+            id: 'doc-pipeline#hash',
+            status: 'INPROGRESS',
+            expiration: Math.floor(Date.now() / 1000) + 3600,
+            in_progress_expiration: Date.now() + 60_000,
+          }),
+        }),
+      );
+
+      const res = await handler(
+        sqsEvent(sqsRecord('concurrent', s3NotificationBody(keyOf(csvId)))),
+        lambdaContext(),
+      );
+
+      expect(res.batchItemFailures).toEqual([{ itemIdentifier: 'concurrent' }]);
+      expect(s3.commandCalls(GetObjectCommand)).toHaveLength(0);
+    });
+
+    it('releases the idempotency record when processing fails so the retry can run', async () => {
+      await handler(
+        sqsEvent(sqsRecord('poison', s3NotificationBody(keyOf(pdfId)))),
+        lambdaContext(),
+      );
+      expect(idem.commandCalls(DeleteItemCommand)).toHaveLength(1);
+    });
   });
 });
