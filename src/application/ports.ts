@@ -12,6 +12,18 @@ export interface DocumentRepository {
    * Returns false when another writer got there first.
    */
   transition(next: Document, expected: DocumentStatus): Promise<boolean>;
+  /** Newest first. `cursor` is opaque to callers and bound to the tenant that received it. */
+  list(tenantId: TenantId, page: PageRequest): Promise<Page<Document>>;
+}
+
+export interface PageRequest {
+  limit: number;
+  cursor?: string;
+}
+
+export interface Page<T> {
+  items: T[];
+  nextCursor?: string;
 }
 
 export interface UploadRequest {

@@ -27,6 +27,7 @@ function setup(opts: { doc?: Document | null; bytes?: Uint8Array | null; size?: 
   let stored: Document | null = opts.doc === undefined ? pending('text/csv') : opts.doc;
   const repository: DocumentRepository = {
     create: jest.fn(),
+    list: jest.fn(),
     get: jest.fn(() => Promise.resolve(stored)),
     transition: jest.fn((next: Document, expected) => {
       if (stored?.status !== expected) return Promise.resolve(false);

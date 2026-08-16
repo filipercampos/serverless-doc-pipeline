@@ -16,6 +16,7 @@ function setup() {
       return Promise.resolve();
     }),
     get: jest.fn(),
+    list: jest.fn(),
     transition: jest.fn(),
   };
   const signer: UploadSigner = {
