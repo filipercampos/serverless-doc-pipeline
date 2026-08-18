@@ -1,12 +1,15 @@
 import { DynamoDbDocumentRepository } from '../adapters/dynamodb-document-repository';
 import { QueryDocuments } from '../application/query-documents';
-import { dynamoDbDocumentClient } from '../infra/aws-clients';
+import type { TenantId } from '../domain/tenant';
 import { requireEnv } from '../infra/env';
+import { tenantClientPoolFromEnv } from '../infra/tenant-clients';
 import { handleHttp, json, type HttpEvent, type HttpResult } from './http';
 
-const useCase = new QueryDocuments(
-  new DynamoDbDocumentRepository(dynamoDbDocumentClient(), requireEnv('DOCUMENTS_TABLE')),
-);
+const tableName = requireEnv('DOCUMENTS_TABLE');
+const clients = tenantClientPoolFromEnv();
+
+const useCaseFor = (tenantId: TenantId) =>
+  new QueryDocuments(new DynamoDbDocumentRepository(clients.for(tenantId).dynamo, tableName));
 
 /**
  * GET /documents/{documentId} — status and extracted metadata.
@@ -15,6 +18,7 @@ const useCase = new QueryDocuments(
  */
 export const handler = (event: HttpEvent): Promise<HttpResult> =>
   handleHttp(event, async (tenantId) => {
+    const useCase = useCaseFor(tenantId);
     const documentId = event.pathParameters?.documentId;
     if (documentId !== undefined) {
       return json(200, await useCase.get(tenantId, documentId));
