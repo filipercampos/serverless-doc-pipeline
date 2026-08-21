@@ -1,9 +1,11 @@
 import type {
   APIGatewayProxyEventV2WithJWTAuthorizer,
   APIGatewayProxyStructuredResultV2,
+  Context,
 } from 'aws-lambda';
 import { DocumentNotFoundError, DomainError, ValidationError } from '../domain/errors';
 import { parseTenantId, type TenantId } from '../domain/tenant';
+import { logger, observe, tracer } from '../infra/observability';
 
 export type HttpEvent = APIGatewayProxyEventV2WithJWTAuthorizer;
 export type HttpResult = APIGatewayProxyStructuredResultV2;
@@ -71,11 +73,15 @@ export function problem(
   };
 }
 
-export interface ErrorReporter {
-  (err: unknown): void;
-}
+export type ErrorReporter = (err: unknown) => void;
 
-export function toHttpError(err: unknown, requestId: string, report: ErrorReporter): HttpResult {
+const reportToLogs: ErrorReporter = (err) => logger.error('unhandled error', err as Error);
+
+export function toHttpError(
+  err: unknown,
+  requestId: string,
+  report: ErrorReporter = reportToLogs,
+): HttpResult {
   if (err instanceof UnauthorizedError) return problem(403, 'forbidden', err.message, requestId);
   if (err instanceof DocumentNotFoundError) return problem(404, err.code, err.message, requestId);
   if (err instanceof DomainError) return problem(400, err.code, err.message, requestId);
@@ -83,16 +89,40 @@ export function toHttpError(err: unknown, requestId: string, report: ErrorReport
   return problem(500, 'internal_error', 'unexpected error, retry later', requestId);
 }
 
-/** Wraps a route: resolves the tenant, runs the action, maps failures to problem details. */
-export async function handleHttp(
+/**
+ * Wraps a route: resolves the tenant, runs the action, maps failures to problem details.
+ * The API Gateway request id is the correlation id: it is in every log line, in the X-Ray
+ * annotations and in problem responses, so a tenant's support ticket can be traced end to end.
+ */
+export function handleHttp(
   event: HttpEvent,
+  context: Context | undefined,
   action: (tenantId: TenantId) => Promise<HttpResult>,
-  report: ErrorReporter = () => undefined,
 ): Promise<HttpResult> {
   const requestId = event.requestContext.requestId;
-  try {
-    return await action(tenantFromEvent(event));
-  } catch (err) {
-    return toHttpError(err, requestId, report);
-  }
+  const claim = event.requestContext.authorizer?.jwt?.claims?.[TENANT_CLAIM];
+  return observe(
+    context,
+    {
+      correlationId: requestId,
+      route: event.routeKey,
+      tenantId: typeof claim === 'string' ? claim : undefined,
+    },
+    async () => {
+      try {
+        const tenantId = tenantFromEvent(event);
+        tracer.putAnnotation('tenantId', tenantId);
+        const result = await action(tenantId);
+        logger.info('request completed', { statusCode: result.statusCode });
+        return result;
+      } catch (err) {
+        const result = toHttpError(err, requestId);
+        logger.info('request failed', {
+          statusCode: result.statusCode,
+          errorCode: err instanceof DomainError ? err.code : undefined,
+        });
+        return result;
+      }
+    },
+  );
 }

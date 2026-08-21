@@ -8,6 +8,8 @@ export interface S3ObjectRef {
   eTag?: string;
   /** Present when bucket versioning is enabled. */
   versionId?: string;
+  /** When S3 accepted the object; used for the upload-to-processed latency metric. */
+  eventTime: string;
   /** Orders events for the same key; identical across duplicate deliveries of one event. */
   sequencer: string;
 }
@@ -47,5 +49,6 @@ export function parseS3Notification(body: string): S3ObjectRef[] {
       eTag: r.s3.object.eTag,
       versionId: r.s3.object.versionId,
       sequencer: r.s3.object.sequencer,
+      eventTime: r.eventTime,
     }));
 }

@@ -1,3 +1,4 @@
+import type { Context } from 'aws-lambda';
 import { DynamoDbDocumentRepository } from '../adapters/dynamodb-document-repository';
 import { S3UploadSigner } from '../adapters/s3-upload-signer';
 import { systemClock } from '../application/ports';
@@ -6,6 +7,7 @@ import { uuidv7 } from '../domain/ids';
 import type { TenantId } from '../domain/tenant';
 import { DEFAULT_UPLOAD_POLICY } from '../domain/upload-policy';
 import { intEnv, requireEnv } from '../infra/env';
+import { MetricUnit, metrics } from '../infra/observability';
 import { tenantClientPoolFromEnv } from '../infra/tenant-clients';
 import { handleHttp, json, parseJsonBody, type HttpEvent, type HttpResult } from './http';
 
@@ -34,8 +36,9 @@ function useCaseFor(tenantId: TenantId): RequestUpload {
 }
 
 /** POST /documents — returns a presigned POST scoped to the caller's tenant prefix. */
-export const handler = (event: HttpEvent): Promise<HttpResult> =>
-  handleHttp(event, async (tenantId) => {
+export const handler = (event: HttpEvent, context?: Context): Promise<HttpResult> =>
+  handleHttp(event, context, async (tenantId) => {
     const ticket = await useCaseFor(tenantId).execute(tenantId, parseJsonBody(event));
+    metrics.addMetric('UploadTicketsIssued', MetricUnit.Count, 1);
     return json(201, ticket, { location: `/documents/${ticket.documentId}` });
   });

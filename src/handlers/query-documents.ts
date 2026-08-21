@@ -1,3 +1,4 @@
+import type { Context } from 'aws-lambda';
 import { DynamoDbDocumentRepository } from '../adapters/dynamodb-document-repository';
 import { QueryDocuments } from '../application/query-documents';
 import type { TenantId } from '../domain/tenant';
@@ -16,8 +17,8 @@ const useCaseFor = (tenantId: TenantId) =>
  * GET /documents              — newest first, `?limit=&cursor=`.
  * One function for both read routes: same IAM permissions, shared warm pool.
  */
-export const handler = (event: HttpEvent): Promise<HttpResult> =>
-  handleHttp(event, async (tenantId) => {
+export const handler = (event: HttpEvent, context?: Context): Promise<HttpResult> =>
+  handleHttp(event, context, async (tenantId) => {
     const useCase = useCaseFor(tenantId);
     const documentId = event.pathParameters?.documentId;
     if (documentId !== undefined) {
