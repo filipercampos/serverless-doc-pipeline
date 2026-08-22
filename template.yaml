@@ -1,0 +1,663 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  Multi-tenant document ingestion pipeline: Cognito-authenticated presigned uploads,
+  S3 -> SQS -> Lambda processing with idempotency and partial batch failures,
+  DynamoDB status store and EventBridge DocumentProcessed events.
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Default: dev
+  AllowedOrigin:
+    Type: String
+    Description: Browser origin allowed to call the API and POST to the bucket
+    Default: 'http://localhost:3300'
+  MaxUploadBytes:
+    Type: Number
+    Default: 10485760
+    MinValue: 1
+    MaxValue: 104857600
+  UploadApiProvisionedConcurrency:
+    Type: Number
+    Description: >-
+      Provisioned concurrency for the upload API alias. 0 disables it. Only worth paying for
+      where the first upload of a user session must not see a cold start (see ADR 0007).
+    Default: 0
+    MinValue: 0
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+  HasProvisionedConcurrency: !Not [!Equals [!Ref UploadApiProvisionedConcurrency, 0]]
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Architectures: [arm64]
+    MemorySize: 512
+    Timeout: 10
+    Tracing: Active
+    Environment:
+      Variables:
+        NODE_OPTIONS: --enable-source-maps
+        POWERTOOLS_SERVICE_NAME: doc-pipeline
+        POWERTOOLS_METRICS_NAMESPACE: DocPipeline
+        POWERTOOLS_LOG_LEVEL: !If [IsProd, INFO, DEBUG]
+        DOCUMENTS_TABLE: !Ref DocumentsTable
+        UPLOAD_BUCKET: !Sub '${AWS::StackName}-uploads-${AWS::AccountId}'
+        MAX_UPLOAD_BYTES: !Ref MaxUploadBytes
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Identity
+  # ---------------------------------------------------------------------------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${AWS::StackName}-users'
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      # Self sign-up is off: users are provisioned by tenant admins, who set custom:tenant_id.
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      MfaConfiguration: OPTIONAL
+      EnabledMfas: [SOFTWARE_TOKEN_MFA]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      Schema:
+        - Name: tenant_id
+          AttributeDataType: String
+          Mutable: false
+          StringAttributeConstraints:
+            MinLength: '2'
+            MaxLength: '63'
+      UserPoolTags:
+        environment: !Ref Environment
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: web
+      GenerateSecret: false
+      ExplicitAuthFlows: [ALLOW_USER_SRP_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+      IdTokenValidity: 60
+      AccessTokenValidity: 60
+      TokenValidityUnits:
+        IdToken: minutes
+        AccessToken: minutes
+      ReadAttributes: [email, custom:tenant_id]
+      # custom:tenant_id is deliberately NOT writable by the client.
+      WriteAttributes: [email]
+
+  # ---------------------------------------------------------------------------
+  # Storage
+  # ---------------------------------------------------------------------------
+  DocumentsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub '${AWS::StackName} uploads bucket encryption'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: kms:*
+            Resource: '*'
+
+  UploadBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: UploadsQueuePolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Built with !Sub (not !Ref) so the queue policy can reference it without a cycle.
+      BucketName: !Sub '${AWS::StackName}-uploads-${AWS::AccountId}'
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt DocumentsKey.Arn
+            # S3 Bucket Keys cut KMS requests (and cost) by orders of magnitude.
+            BucketKeyEnabled: true
+      # Versioning lets the processor pin the validated version (ADR 0004).
+      VersioningConfiguration:
+        Status: Enabled
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [POST]
+            AllowedOrigins: [!Ref AllowedOrigin]
+            AllowedHeaders: ['*']
+            MaxAge: 3000
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-rejected
+            Status: Enabled
+            TagFilters:
+              - Key: pipeline-status
+                Value: rejected
+            ExpirationInDays: 7
+          - Id: expire-orphans
+            Status: Enabled
+            TagFilters:
+              - Key: pipeline-status
+                Value: orphan
+            ExpirationInDays: 7
+          - Id: tier-and-clean-up
+            Status: Enabled
+            Prefix: tenants/
+            Transitions:
+              - StorageClass: INTELLIGENT_TIERING
+                TransitionInDays: 30
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:*
+            Queue: !GetAtt UploadsQueue.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: tenants/
+      Tags:
+        - Key: environment
+          Value: !Ref Environment
+
+  UploadBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref UploadBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt UploadBucket.Arn
+              - !Sub '${UploadBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+          - Sid: DenyWritesOutsideTenantPrefix
+            Effect: Deny
+            Principal: '*'
+            Action: s3:PutObject
+            NotResource: !Sub '${UploadBucket.Arn}/tenants/*'
+
+  DocumentsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      DeletionProtectionEnabled: !If [IsProd, true, false]
+
+  IdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiration
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  # ---------------------------------------------------------------------------
+  # Queues (ADR 0003)
+  # ---------------------------------------------------------------------------
+  UploadsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      # 6x the processor timeout, as recommended for SQS event sources.
+      VisibilityTimeout: 360
+      MessageRetentionPeriod: 345600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt UploadsDlq.Arn
+        maxReceiveCount: 5
+
+  UploadsDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+
+  UploadsDlqPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref UploadsDlq]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: sqs:*
+            Resource: !GetAtt UploadsDlq.Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  UploadsQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref UploadsQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3Notifications
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt UploadsQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:s3:::${AWS::StackName}-uploads-${AWS::AccountId}'
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: sqs:*
+            Resource: !GetAtt UploadsQueue.Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # ---------------------------------------------------------------------------
+  # Events: DocumentProcessed fan-out (ADR 0003)
+  # ---------------------------------------------------------------------------
+  DocumentsBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${AWS::StackName}-documents'
+
+  DocumentsArchive:
+    Type: AWS::Events::Archive
+    Properties:
+      SourceArn: !GetAtt DocumentsBus.Arn
+      Description: Replay source for consumers recovering from bugs
+      RetentionDays: 30
+      EventPattern:
+        source: [doc-pipeline.documents]
+
+  # Example downstream consumer subscription: each consumer owns a queue + DLQ.
+  IndexingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      VisibilityTimeout: 180
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt IndexingDlq.Arn
+        maxReceiveCount: 5
+
+  IndexingDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+
+  IndexingQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref IndexingQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowDocumentProcessedRule
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt IndexingQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt DocumentProcessedToIndexingRule.Arn
+
+  DocumentProcessedToIndexingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: !Ref DocumentsBus
+      Description: Fan DocumentProcessed out to the indexing consumer
+      EventPattern:
+        source: [doc-pipeline.documents]
+        detail-type: [DocumentProcessed]
+      Targets:
+        - Id: indexing-queue
+          Arn: !GetAtt IndexingQueue.Arn
+          DeadLetterConfig:
+            Arn: !GetAtt IndexingDlq.Arn
+          RetryPolicy:
+            MaximumRetryAttempts: 185
+            MaximumEventAgeInSeconds: 86400
+
+  # ---------------------------------------------------------------------------
+  # Tenant isolation (ADR 0005)
+  # ---------------------------------------------------------------------------
+  ApiFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      # Fixed name so TenantAccessRole can trust it without a circular reference.
+      RoleName: !Sub '${AWS::StackName}-api-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AWSXRayDaemonWriteAccess'
+      Policies:
+        - PolicyName: assume-tenant-session
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # The API role itself has NO data access: everything goes through tenant sessions.
+              - Effect: Allow
+                Action: [sts:AssumeRole, sts:TagSession]
+                Resource: !GetAtt TenantAccessRole.Arn
+
+  TenantAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              ArnEquals:
+                aws:PrincipalArn: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-api-${AWS::Region}'
+              StringLike:
+                aws:RequestTag/tenant_id: '?*'
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: sts:TagSession
+            Condition:
+              ArnEquals:
+                aws:PrincipalArn: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-api-${AWS::Region}'
+              ForAllValues:StringEquals:
+                aws:TagKeys: [tenant_id]
+      Policies:
+        - PolicyName: single-tenant-data
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: OwnPartitionOnly
+                Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:Query]
+                Resource: !GetAtt DocumentsTable.Arn
+                Condition:
+                  ForAllValues:StringEquals:
+                    dynamodb:LeadingKeys: ['TENANT#${aws:PrincipalTag/tenant_id}']
+              - Sid: OwnPrefixUploadsOnly
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${UploadBucket.Arn}/tenants/${!aws:PrincipalTag/tenant_id}/*'
+              - Sid: EncryptUploadsViaS3
+                Effect: Allow
+                Action: kms:GenerateDataKey
+                Resource: !GetAtt DocumentsKey.Arn
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub 's3.${AWS::Region}.amazonaws.com'
+
+  # ---------------------------------------------------------------------------
+  # API
+  # ---------------------------------------------------------------------------
+  ApiAccessLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+      Auth:
+        DefaultAuthorizer: CognitoJwt
+        Authorizers:
+          CognitoJwt:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+              # ID tokens carry custom:tenant_id and use the client id as audience.
+              audience: [!Ref UserPoolClient]
+      CorsConfiguration:
+        AllowOrigins: [!Ref AllowedOrigin]
+        AllowMethods: [GET, POST]
+        AllowHeaders: [authorization, content-type]
+        MaxAge: 600
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 200
+        ThrottlingRateLimit: 100
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogs.Arn
+        Format: >-
+          {"requestId":"$context.requestId","ip":"$context.identity.sourceIp","routeKey":"$context.routeKey",
+          "status":"$context.status","latencyMs":"$context.responseLatency","integrationError":"$context.integrationErrorMessage",
+          "tenantId":"$context.authorizer.claims.custom:tenant_id","authError":"$context.authorizer.error"}
+
+  CreateUploadFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints: [src/handlers/create-upload.ts]
+        Target: es2023
+        Minify: true
+        Sourcemap: true
+    Properties:
+      CodeUri: ./
+      Handler: create-upload.handler
+      Description: POST /documents - issues tenant-scoped presigned POST
+      Role: !GetAtt ApiFunctionRole.Arn
+      ReservedConcurrentExecutions: 50
+      AutoPublishAlias: live
+      ProvisionedConcurrencyConfig: !If
+        - HasProvisionedConcurrency
+        - ProvisionedConcurrentExecutions: !Ref UploadApiProvisionedConcurrency
+        - !Ref AWS::NoValue
+      LoggingConfig:
+        LogFormat: JSON
+        LogGroup: !Ref CreateUploadLogs
+      Environment:
+        Variables:
+          TENANT_ROLE_ARN: !GetAtt TenantAccessRole.Arn
+          UPLOAD_URL_TTL_SECONDS: 300
+          PENDING_TTL_SECONDS: 604800
+      Events:
+        CreateUpload:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: POST
+            Path: /documents
+
+  CreateUploadLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+
+  QueryDocumentsFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints: [src/handlers/query-documents.ts]
+        Target: es2023
+        Minify: true
+        Sourcemap: true
+    Properties:
+      CodeUri: ./
+      Handler: query-documents.handler
+      Description: GET /documents and GET /documents/{documentId}
+      Role: !GetAtt ApiFunctionRole.Arn
+      ReservedConcurrentExecutions: 50
+      LoggingConfig:
+        LogFormat: JSON
+        LogGroup: !Ref QueryDocumentsLogs
+      Environment:
+        Variables:
+          TENANT_ROLE_ARN: !GetAtt TenantAccessRole.Arn
+      Events:
+        ListDocuments:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /documents
+        GetDocument:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /documents/{documentId}
+
+  QueryDocumentsLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+
+  # ---------------------------------------------------------------------------
+  # Processing
+  # ---------------------------------------------------------------------------
+  ProcessUploadsFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints: [src/handlers/process-uploads.ts]
+        Target: es2023
+        Minify: true
+        Sourcemap: true
+    Properties:
+      CodeUri: ./
+      Handler: process-uploads.handler
+      Description: S3 -> SQS -> validate, checksum, extract metadata, publish
+      MemorySize: 1024
+      Timeout: 60
+      # Caps pressure on DynamoDB/S3 and protects the account concurrency pool from upload bursts.
+      ReservedConcurrentExecutions: 20
+      LoggingConfig:
+        LogFormat: JSON
+        LogGroup: !Ref ProcessUploadsLogs
+      Environment:
+        Variables:
+          IDEMPOTENCY_TABLE: !Ref IdempotencyTable
+          IDEMPOTENCY_TTL_SECONDS: 86400
+          EVENT_BUS_NAME: !Ref DocumentsBus
+      Policies:
+        - Statement:
+            - Sid: ReadUploadedObjects
+              Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:GetObjectVersion
+                - s3:PutObjectTagging
+                - s3:PutObjectVersionTagging
+              Resource: !Sub 'arn:${AWS::Partition}:s3:::${AWS::StackName}-uploads-${AWS::AccountId}/tenants/*'
+            - Sid: DecryptUploads
+              Effect: Allow
+              Action: kms:Decrypt
+              Resource: !GetAtt DocumentsKey.Arn
+              Condition:
+                StringEquals:
+                  kms:ViaService: !Sub 's3.${AWS::Region}.amazonaws.com'
+            - Sid: DocumentRecords
+              Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem]
+              Resource: !GetAtt DocumentsTable.Arn
+            - Sid: IdempotencyRecords
+              Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem]
+              Resource: !GetAtt IdempotencyTable.Arn
+            - Sid: PublishDocumentEvents
+              Effect: Allow
+              Action: events:PutEvents
+              Resource: !GetAtt DocumentsBus.Arn
+      Events:
+        Uploads:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt UploadsQueue.Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 2
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            ScalingConfig:
+              # Below reserved concurrency so the poller never causes throttling-driven retries.
+              MaximumConcurrency: 18
+
+  ProcessUploadsLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+
+Outputs:
+  ApiUrl:
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  UploadBucketName:
+    Value: !Ref UploadBucket
+  DocumentsTableName:
+    Value: !Ref DocumentsTable
+  EventBusName:
+    Value: !Ref DocumentsBus
+  UploadsDlqUrl:
+    Value: !Ref UploadsDlq

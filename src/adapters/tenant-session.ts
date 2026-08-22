@@ -3,6 +3,7 @@ import type { AwsCredentialIdentity } from '@aws-sdk/types';
 import type { TenantId } from '../domain/tenant';
 
 export const TENANT_TAG = 'tenant_id';
+const MIN_REMAINING_MS = 6 * 60_000;
 
 /**
  * Issues short-lived credentials scoped to ONE tenant (ADR 0005).
@@ -40,8 +41,9 @@ export class TenantSessionFactory {
     if (!this.roleArn) return undefined;
     const now = (this.opts.now ?? Date.now)();
     const cached = this.cache.get(tenantId);
-    // Refresh one minute early so an in-flight request never carries expired credentials.
-    if (cached?.expiration && cached.expiration.getTime() - now > 60_000) return cached;
+    // Presigned POSTs are only valid while the signing credentials are: refresh while the cached
+    // session still outlives the longest URL we may sign (5 min TTL) plus a safety minute.
+    if (cached?.expiration && cached.expiration.getTime() - now > MIN_REMAINING_MS) return cached;
 
     const { Credentials } = await this.sts.send(
       new AssumeRoleCommand({

@@ -15,7 +15,7 @@ Defense in depth, each layer sufficient on its own for the common bugs:
 
 1. **Identity only from the token.** Handlers read the tenant from `requestContext.authorizer.jwt.claims["custom:tenant_id"]`, never from the body, path or query. A token without a well-formed claim gets 403.
 2. **Tenant is the partition key.** `PK = TENANT#<tenantId>`, `SK = DOC#<uuidv7>`; S3 keys are `tenants/<tenantId>/documents/<uuid>` and built only by the server. Tenant ids are restricted to `[a-z0-9-]` so they cannot contain `/`, `#` or `..`.
-3. **Tenant-scoped IAM sessions on the API path.** API functions call `sts:AssumeRole` on `TenantAccessRole` with session tag `tenant_id=<tenant>` (cached ~14 min per tenant). The role allows only:
+3. **Tenant-scoped IAM sessions on the API path.** API functions call `sts:AssumeRole` on `TenantAccessRole` with session tag `tenant_id=<tenant>` (cached per tenant until 6 minutes before expiry, so a presigned POST never outlives its signing session). The role allows only:
    - `dynamodb:GetItem|PutItem|Query` with `ForAllValues:StringEquals dynamodb:LeadingKeys = TENANT#${aws:PrincipalTag/tenant_id}`;
    - `s3:PutObject` on `arn:aws:s3:::<bucket>/tenants/${aws:PrincipalTag/tenant_id}/*`.
    The presigned POST is signed with these credentials, so S3 evaluates the upload against the tenant session: a POST for another tenant's prefix is denied by S3 even if our code produced it.
@@ -31,7 +31,7 @@ Defense in depth, each layer sufficient on its own for the common bugs:
 
 ## Consequences
 
-- One `AssumeRole` per tenant per ~14 minutes per warm instance (STS is free; adds ~tens of ms on that request).
+- One `AssumeRole` per tenant per ~9 minutes per warm instance (15-minute sessions) (STS is free; adds ~tens of ms on that request).
 - `TenantAccessRole` trust policy must allow `sts:TagSession` from the API function roles only.
 - Local runs and LocalStack do not enforce IAM; isolation layer 3 is validated by `cfn-lint` and review, not by integration tests. Layers 1, 2 and 4 are covered by unit tests.
 - The processor's role is broader than a tenant session; its blast radius is limited by not having `Query`/`Scan` and by never being reachable from the API.
