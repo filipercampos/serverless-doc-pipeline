@@ -26,9 +26,14 @@ Parameters:
       where the first upload of a user session must not see a cold start (see ADR 0007).
     Default: 0
     MinValue: 0
+  AlarmTopicArn:
+    Type: String
+    Description: SNS topic for alarm notifications (optional)
+    Default: ''
 
 Conditions:
   IsProd: !Equals [!Ref Environment, prod]
+  HasAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, '']]
   HasProvisionedConcurrency: !Not [!Equals [!Ref UploadApiProvisionedConcurrency, 0]]
 
 Globals:
@@ -646,6 +651,294 @@ Resources:
     Properties:
       RetentionInDays: 30
 
+  # ---------------------------------------------------------------------------
+  # Alarms (runbook: docs/runbook.md)
+  # ---------------------------------------------------------------------------
+  UploadsDlqDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Uploads failed 5 times and were dead-lettered. Runbook "DLQ not empty".
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt UploadsDlq.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+      OKActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  IndexingDlqDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: DocumentProcessed events could not be delivered to or processed by the indexing consumer.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt IndexingDlq.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  # SQS event sources have no IteratorAge (that metric is for Kinesis/DynamoDB streams);
+  # the equivalent backlog signal is the age of the oldest message.
+  UploadsQueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Oldest upload waiting > 15 min (processor stuck, throttled or failing). Runbook "Backlog growing".
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt UploadsQueue.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 3
+      Threshold: 900
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+      OKActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  # End-to-end freshness from our own EMF metric: S3 eventTime -> record written.
+  UploadToProcessedLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: p95 upload-to-processed latency above 60 s for 10 minutes.
+      Namespace: DocPipeline
+      MetricName: UploadToProcessedLatency
+      Dimensions:
+        - Name: service
+          Value: doc-pipeline
+      ExtendedStatistic: p95
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 60000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  ProcessUploadsErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Processor invocation error rate > 5% (whole-invocation failures, not item failures).
+      Metrics:
+        - Id: errors
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref ProcessUploadsFunction
+            Period: 300
+            Stat: Sum
+        - Id: invocations
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Invocations
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref ProcessUploadsFunction
+            Period: 300
+            Stat: Sum
+        - Id: rate
+          Expression: IF(invocations > 10, 100 * errors / invocations, 0)
+          Label: error rate (%)
+          ReturnData: true
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  ProcessUploadsItemFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Sustained batch item failures (retries in progress, DLQ likely to follow).
+      Namespace: DocPipeline
+      MetricName: ProcessingFailures
+      Dimensions:
+        - Name: service
+          Value: doc-pipeline
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  ApiErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: HTTP API 5xx rate > 2% over 10 minutes.
+      Metrics:
+        - Id: errors
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApiGateway
+              MetricName: 5xx
+              Dimensions:
+                - Name: ApiId
+                  Value: !Ref HttpApi
+                - Name: Stage
+                  Value: $default
+            Period: 300
+            Stat: Sum
+        - Id: requests
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApiGateway
+              MetricName: Count
+              Dimensions:
+                - Name: ApiId
+                  Value: !Ref HttpApi
+                - Name: Stage
+                  Value: $default
+            Period: 300
+            Stat: Sum
+        - Id: rate
+          Expression: IF(requests > 20, 100 * errors / requests, 0)
+          Label: 5xx rate (%)
+          ReturnData: true
+      EvaluationPeriods: 2
+      Threshold: 2
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  CreateUploadThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Upload API hit its reserved concurrency (clients get 5xx/429).
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CreateUploadFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  QueryDocumentsThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Query API hit its reserved concurrency.
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref QueryDocumentsFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  # ScalingConfig keeps the poller below reserved concurrency, so throttles here mean
+  # misconfiguration (or the account pool is exhausted), not normal back-pressure.
+  ProcessUploadsThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Processor throttled; check reserved vs. ESM maximum concurrency.
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ProcessUploadsFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  # ---------------------------------------------------------------------------
+  # Dashboard
+  # ---------------------------------------------------------------------------
+  PipelineDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-pipeline'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            { "type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": { "title": "Documents (EMF)", "region": "${AWS::Region}", "stat": "Sum", "period": 300,
+                "metrics": [
+                  [ "DocPipeline", "UploadTicketsIssued", "service", "doc-pipeline" ],
+                  [ ".", "DocumentsProcessed", ".", "." ],
+                  [ ".", "DocumentsRejected", ".", "." ],
+                  [ ".", "DuplicateDeliveries", ".", "." ],
+                  [ ".", "ProcessingFailures", ".", "." ]
+                ] } },
+            { "type": "metric", "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": { "title": "Upload to processed latency (ms)", "region": "${AWS::Region}", "period": 300,
+                "metrics": [
+                  [ "DocPipeline", "UploadToProcessedLatency", "service", "doc-pipeline", { "stat": "p50" } ],
+                  [ "...", { "stat": "p95" } ],
+                  [ "...", { "stat": "p99" } ]
+                ] } },
+            { "type": "metric", "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": { "title": "Uploads queue", "region": "${AWS::Region}", "stat": "Maximum", "period": 60,
+                "metrics": [
+                  [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${UploadsQueue.QueueName}" ],
+                  [ ".", "ApproximateAgeOfOldestMessage", ".", ".", { "yAxis": "right" } ],
+                  [ ".", "ApproximateNumberOfMessagesVisible", ".", "${UploadsDlq.QueueName}", { "label": "DLQ depth" } ]
+                ] } },
+            { "type": "metric", "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": { "title": "Processor", "region": "${AWS::Region}", "period": 60,
+                "metrics": [
+                  [ "AWS/Lambda", "ConcurrentExecutions", "FunctionName", "${ProcessUploadsFunction}", { "stat": "Maximum" } ],
+                  [ ".", "Errors", ".", ".", { "stat": "Sum" } ],
+                  [ ".", "Throttles", ".", ".", { "stat": "Sum" } ],
+                  [ ".", "Duration", ".", ".", { "stat": "p95", "yAxis": "right" } ]
+                ] } },
+            { "type": "metric", "x": 0, "y": 12, "width": 12, "height": 6,
+              "properties": { "title": "HTTP API", "region": "${AWS::Region}", "period": 60,
+                "metrics": [
+                  [ "AWS/ApiGateway", "Count", "ApiId", "${HttpApi}", "Stage", "$default", { "stat": "Sum" } ],
+                  [ ".", "4xx", ".", ".", ".", ".", { "stat": "Sum" } ],
+                  [ ".", "5xx", ".", ".", ".", ".", { "stat": "Sum" } ],
+                  [ ".", "Latency", ".", ".", ".", ".", { "stat": "p95", "yAxis": "right" } ]
+                ] } },
+            { "type": "metric", "x": 12, "y": 12, "width": 12, "height": 6,
+              "properties": { "title": "API functions", "region": "${AWS::Region}", "period": 60,
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${CreateUploadFunction}", { "stat": "p95" } ],
+                  [ "...", "${QueryDocumentsFunction}", { "stat": "p95" } ],
+                  [ ".", "Throttles", ".", "${CreateUploadFunction}", { "stat": "Sum", "yAxis": "right" } ],
+                  [ "...", "${QueryDocumentsFunction}", { "stat": "Sum", "yAxis": "right" } ]
+                ] } }
+          ]
+        }
+
 Outputs:
   ApiUrl:
     Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
@@ -661,3 +954,5 @@ Outputs:
     Value: !Ref DocumentsBus
   UploadsDlqUrl:
     Value: !Ref UploadsDlq
+  DashboardUrl:
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home#dashboards:name=${AWS::StackName}-pipeline'
