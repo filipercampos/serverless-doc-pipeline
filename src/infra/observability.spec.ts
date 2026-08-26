@@ -8,14 +8,18 @@ describe('observe', () => {
     const append = jest.spyOn(logger, 'appendKeys');
 
     await expect(
-      observe(lambdaContext(), { tenantId: 'acme' }, () => Promise.resolve(1)),
+      observe(lambdaContext(), { tenantId: 'acme' }, () => {
+        metrics.addMetric('Test', 'Count', 1);
+        return Promise.resolve(1);
+      }),
     ).resolves.toBe(1);
     await expect(
       observe(undefined, { tenantId: 'globex' }, () => Promise.reject(new Error('boom'))),
     ).rejects.toThrow('boom');
 
     expect(append).toHaveBeenCalledWith({ tenantId: 'acme' });
-    expect(publish).toHaveBeenCalledTimes(2);
+    // Published only when something was recorded.
+    expect(publish).toHaveBeenCalledTimes(1);
     expect(reset).toHaveBeenCalledTimes(2);
   });
 });

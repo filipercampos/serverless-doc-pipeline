@@ -1,0 +1,19 @@
+name: serverless-doc-pipeline
+
+# Local AWS for manual runs. Integration tests start their own LocalStack through
+# Testcontainers on a random port, so they never collide with this one.
+services:
+  localstack:
+    image: localstack/localstack:3.8
+    environment:
+      SERVICES: s3,sqs,dynamodb,events,sts
+      AWS_DEFAULT_REGION: us-east-1
+      # Path-style URLs so presigned POST form actions resolve to localhost.
+      S3_SKIP_SIGNATURE_VALIDATION: '0'
+    ports:
+      - '4569:4566'
+    healthcheck:
+      test: ['CMD', 'curl', '-sf', 'http://localhost:4566/_localstack/health']
+      interval: 3s
+      timeout: 3s
+      retries: 30

@@ -15,12 +15,16 @@
     "test:int": "jest --selectProjects integration --runInBand --testTimeout=120000",
     "test:all": "npm test && npm run test:int",
     "build": "tsx scripts/build.ts",
-    "measure:init": "tsx scripts/measure-init.ts"
+    "measure:init": "tsx scripts/measure-init.ts",
+    "local": "tsx scripts/local-api.ts",
+    "local:bootstrap": "tsx scripts/localstack-bootstrap.ts"
   },
   "devDependencies": {
+    "@aws-sdk/client-sqs": "^3.1116.0",
     "@aws-sdk/util-dynamodb": "^3.996.8",
     "@eslint/js": "^9.39.5",
     "@smithy/util-stream": "^4.7.16",
+    "@testcontainers/localstack": "^12.1.0",
     "@types/aws-lambda": "^8.10.162",
     "@types/jest": "^29.5.14",
     "@types/node": "^22.20.1",
@@ -29,6 +33,7 @@
     "eslint": "^9.39.5",
     "jest": "^29.7.0",
     "prettier": "^3.9.6",
+    "testcontainers": "^12.1.0",
     "ts-jest": "^29.4.12",
     "tsx": "^4.23.12",
     "typescript": "5.7",

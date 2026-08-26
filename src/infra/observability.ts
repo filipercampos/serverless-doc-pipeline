@@ -52,7 +52,8 @@ export async function observe<T>(
   } finally {
     subsegment?.close();
     if (parent) tracer.setSegment(parent);
-    metrics.publishStoredMetrics();
+    // Read-only invocations may record nothing; skip the flush instead of logging a warning.
+    if (metrics.hasStoredMetrics()) metrics.publishStoredMetrics();
     logger.resetKeys();
   }
 }
