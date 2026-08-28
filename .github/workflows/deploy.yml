@@ -1,0 +1,37 @@
+name: deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment (samconfig profile)
+        type: choice
+        options: [default, prod]
+        default: default
+
+permissions:
+  contents: read
+  id-token: write # OIDC to AWS, no long-lived keys
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    environment: ${{ inputs.environment == 'prod' && 'production' || 'development' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - run: npm ci
+      - run: sam build --parallel
+      - run: >-
+          sam deploy --config-env ${{ inputs.environment }}
+          --no-confirm-changeset --no-fail-on-empty-changeset

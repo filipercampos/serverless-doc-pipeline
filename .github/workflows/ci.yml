@@ -1,0 +1,77 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npx prettier --check "{src,test,scripts}/**/*.ts"
+      - run: npm test -- --coverage
+      - name: Bundle handlers (esbuild) and report sizes
+        run: npm run build
+
+  integration:
+    runs-on: ubuntu-24.04
+    needs: verify
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      # Testcontainers starts LocalStack on a random port.
+      - run: npm run test:int
+
+  iac:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install "cfn-lint<1.30"
+      - run: cfn-lint template.yaml
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+      - run: sam validate --lint --region us-east-1
+
+  package:
+    runs-on: ubuntu-24.04
+    needs: [verify, integration, iac]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+      - run: npm ci
+      - run: sam build --parallel
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sam-build
+          path: .aws-sam/build
+          retention-days: 7
