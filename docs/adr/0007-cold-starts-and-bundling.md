@@ -37,7 +37,7 @@ Not measured: real Lambda `Init Duration` (requires a deployment). The README st
 
 ## Alternatives considered
 
-- **SnapStart for Node.js.** Not available for the Node.js runtime at the time of writing (Java, Python, .NET only).
+- **SnapStart.** Not offered for the Node.js runtime as far as we know at the time of writing (it targets Java, Python and .NET); revisit if that changes.
 - **Externalise `@aws-sdk/*`.** Smaller zip, but the runtime's SDK is a full, un-tree-shaken install whose load time is also paid at init, and its version is outside our control.
 - **Provisioned concurrency everywhere.** Pays for idle capacity on paths where nobody waits.
 - **Lazy-load `pdf-lib`/`csv-parse` per content type.** Possible next step for the processor; not worth it while its cold starts are invisible to users.
