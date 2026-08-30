@@ -46,7 +46,7 @@ Roughly **US$ 25 per million documents**, dominated by S3 POST requests, API Gat
 | Noncurrent versions (30 days) | only for overwrites; usually ~0 |
 | KMS customer managed key | 1.00 |
 | Custom metrics (≈10 EMF metrics × service dimension) | ~3.00 |
-| Alarms (≈11 standard alarms, 2 with metric math) | ~1.50 |
+| Alarms (10: 8 standard, 2 with metric math) | ~1.50 |
 | Dashboard | 3.00 |
 | Cognito | per monthly active user, by tier — depends on tenant user count |
 | Provisioned concurrency (prod: 2 × 512 MB on the upload alias) | ~8.60 (2 × 0.5 GB × 2.592M s × 0.0000033334 GB-s) + reduced duration price |
