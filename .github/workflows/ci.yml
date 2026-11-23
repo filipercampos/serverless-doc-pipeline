@@ -69,6 +69,9 @@ jobs:
         with:
           use-installer: true
       - run: npm ci
+      # SAM installs only production deps in its scratch dir, so the esbuild devDependency
+      # must be found on PATH.
+      - run: echo "$PWD/node_modules/.bin" >> "$GITHUB_PATH"
       - run: sam build --parallel
       - uses: actions/upload-artifact@v4
         with:
